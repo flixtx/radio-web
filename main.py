@@ -7,25 +7,22 @@ import time
 import asyncio
 import logging
 import hashlib
+import uuid
 from collections import deque
 from typing import Optional, Set, Dict
 from mutagen import File as MutagenFile
 
 app = FastAPI()
 
-# Diretório de áudio
 AUDIO_DIR = os.getenv("AUDIO_DIR", "audio_files")
 Path(AUDIO_DIR).mkdir(parents=True, exist_ok=True)
 
-# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("radio")
 
-# Autenticação simples
 ADMIN_PASSWORD = "sua senha admim aqui"
 SESSIONS: Set[str] = set()
 
-# Middleware CORS (se necessário)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -71,25 +68,31 @@ class RadioBroadcaster:
             try:
                 audio = MutagenFile(path)
                 self.current_track_duration = int(audio.info.length) if audio and audio.info else 180
+                if hasattr(audio.info, "bitrate") and audio.info.bitrate:
+                    bitrate_kbps = audio.info.bitrate // 1000
+                    bytes_per_second = audio.info.bitrate // 8
+                else:
+                    bitrate_kbps = 128
+                    bytes_per_second = 128000 // 8
+                logger.info(f"Tocando: {track} ({self.current_track_duration}s, {bitrate_kbps}kbps)")
             except Exception as e:
-                logger.error(f"Erro lendo duração do arquivo {track}: {e}")
+                logger.error(f"Erro lendo duração ou bitrate do arquivo {track}: {e}")
                 self.current_track_duration = 180
+                bytes_per_second = 128000 // 8
 
             self.playback_start_time = time.time()
-            logger.info(f"Tocando: {track} ({self.current_track_duration}s)")
 
             try:
                 with open(path, "rb") as f:
                     chunk_size = 8192
-                    bytes_per_second = 16384  # approx for bitrate ~128kbps
                     bytes_sent = 0
                     start_time = time.time()
 
                     while chunk := f.read(chunk_size):
                         for client_id, q in list(self.listeners_queues.items()):
                             try:
-                                q.put_nowait(chunk)
-                            except asyncio.QueueFull:
+                                await asyncio.wait_for(q.put(chunk), timeout=0.01)
+                            except (asyncio.QueueFull, asyncio.TimeoutError):
                                 pass
                         bytes_sent += len(chunk)
                         expected_time = bytes_sent / bytes_per_second
@@ -111,7 +114,7 @@ class RadioBroadcaster:
     def add_listener(self, client_id):
         if client_id not in self.listeners:
             self.listeners.add(client_id)
-            self.listeners_queues[client_id] = asyncio.Queue(maxsize=10)
+            self.listeners_queues[client_id] = asyncio.Queue(maxsize=300)
             logger.info(f"Novo ouvinte: {client_id} | Total ouvintes: {len(self.listeners)}")
 
     def remove_listener(self, client_id):
@@ -210,7 +213,7 @@ async def homepage():
 
 @app.get("/stream")
 async def stream(request: Request):
-    client_id = request.client.host
+    client_id = str(uuid.uuid4())  # Identificador único por conexão
     broadcaster.add_listener(client_id)
 
     async def audio_stream():
@@ -258,7 +261,6 @@ async def login_post(password: str = Form(...)):
 def get_admin(request: Request):
     token = request.cookies.get("admin_token")
     if token not in SESSIONS:
-        # Usar Exception para forçar redirecionamento
         from starlette.exceptions import HTTPException
         raise HTTPException(status_code=307, detail="Redirecionar para login", headers={"Location": "/admin-login"})
     return None
